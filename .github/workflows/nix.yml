@@ -1,0 +1,61 @@
+name: Nix CI
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  BUILD_CMD: "nix build -L -v --log-format bar-with-logs"
+  RUN_CMD: "nix run .#default -L -v --log-format bar-with-logs -- --help"
+  RUN_TESTS_CMD: "nix develop -L -v --log-format bar-with-logs -c python3 test_syng.py"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nix flake check
+        run: |
+          nix flake check
+
+      - name: Nix build
+        run: |
+          echo $BUILD_CMD
+          eval $BUILD_CMD
+
+      - name: Run syng tests
+        run: |
+          echo $RUN_TESTS_CMD
+          eval $RUN_TESTS_CMD
+
+      - name: Run syng --help
+        run: |
+          echo $RUN_CMD
+          # Build the flake and run the help command
+          output=$(eval $RUN_CMD)
+
+          # Echo the output for debugging
+          echo "Help output:"
+          echo "$output"
+
+          # Check if the output contains expected text
+          if echo "$output" | grep -q 'GIT_DIR'; then
+            echo "✓ Help text contains 'GIT_DIR' as expected"
+          else
+            echo "✗ Help text does not contain 'GIT_DIR'"
+            exit 1
+          fi
+
