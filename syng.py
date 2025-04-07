@@ -5,6 +5,7 @@ import os
 import time
 import sys
 import logging
+import threading
 from pathlib import Path
 from typing import Set, Optional
 import git
@@ -23,7 +24,8 @@ class GitSyncer:
         git_dir: str,
         commit_push: bool = False,
         auto_pull: bool = False,
-        per_file: bool = False
+        per_file: bool = False,
+        pull_interval: Optional[int] = None
     ):
         self.source_dir = Path(source_dir).resolve()
         # Store the original git_dir path for comparison and copy logic
@@ -31,10 +33,12 @@ class GitSyncer:
         self.commit_push = commit_push
         self.auto_pull = auto_pull
         self.per_file = per_file
+        self.pull_interval = pull_interval
+        self._stop_event: Optional[threading.Event] = None
         self.processed_files: Set[Path] = set()
         
         logger.info(f"Initializing GitSyncer with source_dir={self.source_dir}, git_dir={self._original_git_dir}")
-        logger.info(f"Options: commit_push={commit_push}, auto_pull={auto_pull}, per_file={per_file}")
+        logger.info(f"Options: commit_push={commit_push}, auto_pull={auto_pull}, per_file={per_file}, pull_interval={pull_interval}")
         
         # Ensure directories exist
         if not self.source_dir.exists():
@@ -53,6 +57,17 @@ class GitSyncer:
             # Store the working tree directory (repo root)
             self.repo_root = Path(self.repo.working_dir).resolve() 
             logger.info(f"Opened repository at {self.repo_root} (found via {self._original_git_dir})")
+
+            # Start periodic pull thread if needed
+            if self.auto_pull and self.pull_interval is not None and self.pull_interval > 0:
+                self._stop_event = threading.Event()
+                self._pull_thread = threading.Thread(
+                    target=self._periodic_pull_worker,
+                    args=(self._stop_event,),
+                    daemon=True # Exit automatically when main thread exits
+                )
+                self._pull_thread.start()
+                logger.info(f"Started periodic pull thread with interval {self.pull_interval}s")
         except git.InvalidGitRepositoryError:
             # If search fails, raise the error referring to the original path
             raise ValueError(f"Could not find a git repository at or above: {self._original_git_dir}")
@@ -211,11 +226,6 @@ class GitSyncer:
             
         logger.info(f"Found {len(new_files)} new files to process")
         
-        # Pull changes first if auto_pull is enabled
-        if self.auto_pull and not self.pull():
-            logger.warning("Skipping processing due to pull failure")
-            return
-        
         if self.per_file:
             # Commit each file individually
             for file_path in new_files:
@@ -275,12 +285,28 @@ class GitSyncer:
             while True:
                 self.process_new_files()
                 # Sleep to avoid high CPU usage
-                time.sleep(5)
+                time.sleep(5) # Keep the existing sleep for file checking
         except KeyboardInterrupt:
             logger.info("Syncer stopped by user")
+            if self._stop_event:
+                logger.info("Signaling pull thread to stop...")
+                self._stop_event.set()
         except Exception as e:
             logger.exception(f"Syncer stopped due to error: {e}")
+            if self._stop_event:
+                self._stop_event.set() # Also signal stop on other errors
             sys.exit(1)
+
+    def _periodic_pull_worker(self, stop_event: threading.Event) -> None:
+        """Worker function for the background pull thread."""
+        # Perform an initial pull immediately if desired (optional)
+        # self.pull() 
+        while not stop_event.wait(timeout=self.pull_interval): # Wait for interval or stop signal
+            logger.info("Pull interval elapsed, attempting to pull changes...")
+            if not self.pull():
+                logger.warning("Pull failed, will retry next interval.")
+            # Loop continues until stop_event is set
+        logger.info("Periodic pull worker stopping.")
 
 def main():
     parser = argparse.ArgumentParser(description="Sync files between a source directory and a git repository")
@@ -289,15 +315,20 @@ def main():
     parser.add_argument("--commit-push", action="store_true", help="Commit and push new files")
     parser.add_argument("--auto-pull", action="store_true", help="Automatically pull changes from remote")
     parser.add_argument("--per-file", action="store_true", help="Create a separate commit for each new file")
+    parser.add_argument("--pull-interval", type=int, default=60, help="Interval in seconds to automatically pull changes (requires --auto-pull). Default: 60")
     
     args = parser.parse_args()
     
+    # Ensure auto_pull is enabled if a pull_interval is used effectively
+    pull_interval_value = args.pull_interval if args.auto_pull else None
+
     syncer = GitSyncer(
         source_dir=args.source_dir,
         git_dir=args.git_dir,
         commit_push=args.commit_push,
         auto_pull=args.auto_pull,
-        per_file=args.per_file
+        per_file=args.per_file,
+        pull_interval=pull_interval_value
     )
     
     syncer.run()
