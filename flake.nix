@@ -12,6 +12,9 @@
         pkgs = nixpkgs.legacyPackages.${system};
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           gitpython
+          pytest
+          pytest-mock
+          typing-extensions
         ]);
       in
       {

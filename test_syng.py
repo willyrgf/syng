@@ -286,6 +286,9 @@ class TestGitSyncer(unittest.TestCase):
             per_file=True
         )
         
+        # Set up the upstream branch explicitly before processing files
+        self.repo.git.push('--set-upstream', 'origin', self.repo.active_branch.name)
+        
         # Process new files
         syncer.process_new_files()
         

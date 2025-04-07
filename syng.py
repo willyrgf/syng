@@ -142,6 +142,23 @@ class GitSyncer:
         try:
             for remote in self.repo.remotes:
                 logger.info(f"Pushing to remote: {remote.name}")
+                
+                # Check if current branch has an upstream branch
+                branch = self.repo.active_branch
+                tracking_branch = branch.tracking_branch()
+                
+                if tracking_branch is None and len(self.repo.remotes) > 0:
+                    # Set upstream branch for the current branch if not set
+                    try:
+                        logger.info(f"Setting upstream branch for {branch} to {remote.name}/{branch}")
+                        self.repo.git.push('--set-upstream', remote.name, branch.name)
+                        # Return after setting upstream - this push already sent our changes
+                        return True
+                    except git.GitCommandError as e:
+                        logger.error(f"Failed to set upstream branch: {e}")
+                        # Continue to try normal push
+                
+                # Normal push if upstream is already set
                 push_info = remote.push()
                 logger.info(f"Push result: {push_info}")
             return True
