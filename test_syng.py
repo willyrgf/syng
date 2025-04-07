@@ -425,16 +425,22 @@ class TestGitSyncer(unittest.TestCase):
         external_repo.git.commit("-m", "Add external file")
         external_repo.git.push()
         
-        # Initialize GitSyncer with auto-pull enabled
+        # Initialize GitSyncer with auto-pull enabled and a short interval for testing
         syncer = GitSyncer(
             source_dir=local_repo_path,
             git_dir=local_repo_path,
             commit_push=False,
             auto_pull=True,
-            per_file=True
+            per_file=True,
+            pull_interval=1 # Explicitly set a short interval for the test
         )
         
+        # Wait for the background pull thread to potentially run
+        time.sleep(1.5) # Wait slightly longer than the pull interval
+        
         # Directly call process_new_files a few times instead of using a thread
+        # Note: process_new_files no longer triggers pull, the background thread handles it.
+        # We might not even need this loop anymore, but leaving it for now.
         for _ in range(3):
             syncer.process_new_files()
         
