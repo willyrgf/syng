@@ -26,28 +26,36 @@ class GitSyncer:
         per_file: bool = False
     ):
         self.source_dir = Path(source_dir).resolve()
-        self.git_dir = Path(git_dir).resolve()
+        # Store the original git_dir path for comparison and copy logic
+        self._original_git_dir = Path(git_dir).resolve() 
         self.commit_push = commit_push
         self.auto_pull = auto_pull
         self.per_file = per_file
         self.processed_files: Set[Path] = set()
         
-        logger.info(f"Initializing GitSyncer with source_dir={self.source_dir}, git_dir={self.git_dir}")
+        logger.info(f"Initializing GitSyncer with source_dir={self.source_dir}, git_dir={self._original_git_dir}")
         logger.info(f"Options: commit_push={commit_push}, auto_pull={auto_pull}, per_file={per_file}")
         
         # Ensure directories exist
         if not self.source_dir.exists():
             raise FileNotFoundError(f"Source directory does not exist: {self.source_dir}")
         
-        if not self.git_dir.exists():
-            raise FileNotFoundError(f"Git directory does not exist: {self.git_dir}")
+        # Use the original path for the existence check
+        if not self._original_git_dir.exists(): 
+            raise FileNotFoundError(f"Git directory does not exist: {self._original_git_dir}")
             
-        # Initialize git repository
+        # Initialize git repository, searching parent directories
         try:
-            self.repo = git.Repo(self.git_dir)
-            logger.info(f"Opened existing repository at {self.git_dir}")
+            # Search upwards from the original git_dir path
+            self.repo = git.Repo(self._original_git_dir, search_parent_directories=True) 
+            # Store the actual git directory found (.git folder)
+            self.git_dir = Path(self.repo.git_dir).resolve() 
+            # Store the working tree directory (repo root)
+            self.repo_root = Path(self.repo.working_dir).resolve() 
+            logger.info(f"Opened repository at {self.repo_root} (found via {self._original_git_dir})")
         except git.InvalidGitRepositoryError:
-            raise ValueError(f"Git directory is not a git repository: {self.git_dir}")
+            # If search fails, raise the error referring to the original path
+            raise ValueError(f"Could not find a git repository at or above: {self._original_git_dir}")
     
     def pull(self) -> bool:
         """Pull changes from remote repository."""
@@ -69,25 +77,29 @@ class GitSyncer:
         current_files = set()
         for root, _, files in os.walk(self.source_dir):
             root_path = Path(root).resolve()
-            # Skip .git directory if source_dir is same as git_dir
-            if ".git" in root_path.parts:
+            # Skip .git directory belonging to the discovered repo
+            # Also skip if source_dir itself is inside the .git dir (edge case)
+            if self.git_dir == root_path or self.git_dir in root_path.parents:
                 continue
                 
             for file in files:
                 file_path = (root_path / file).resolve()
                 if file_path.is_file():
-                    # Get path relative to source_dir
-                    if self.source_dir == self.git_dir:
-                        # If source_dir is the same as git_dir, process all files
-                        rel_path = file_path.relative_to(self.source_dir)
+                    # Check if the file is within the source directory (redundant check removed)
+                    # Determine if we need to copy the file or if it's already in the repo
+                    if self.source_dir == self.repo_root or self.source_dir in self.repo_root.parents:
+                         # If source is the repo root or a parent, we treat files as directly in the repo
+                         # (This case simplifies if source == original_git_dir and original_git_dir was a subdir)
+                         current_files.add(file_path)
+                    elif self.repo_root in self.source_dir.parents:
+                        # If source is a subdirectory of the repo root (common case)
                         current_files.add(file_path)
                     else:
-                        # Handle files from source_dir that need to be copied to git_dir
-                        rel_path = file_path.relative_to(self.source_dir)
-                        dest_path = self.git_dir / rel_path
-                        current_files.add(file_path)
+                         # If source is completely outside the repo (needs copying)
+                         current_files.add(file_path)
         
-        # Return files that haven't been processed yet
+        # Return files that haven't been processed yet or have been modified
+        # Note: Modification check isn't explicitly here, relies on reprocessing logic later
         return current_files - self.processed_files
     
     def commit_file(self, file_path: Path) -> bool:
@@ -95,37 +107,45 @@ class GitSyncer:
         try:
             # Resolve the file path to handle symlinks
             file_path = file_path.resolve()
-            
-            if self.source_dir != self.git_dir:
-                # Copy file to git_dir if source_dir is different
-                rel_path = file_path.relative_to(self.source_dir)
-                dest_path = (self.git_dir / rel_path).resolve()
-                
+
+            # Determine if the file is inside the repo or needs copying
+            is_inside_repo = self.repo_root in file_path.parents or self.repo_root == file_path.parent
+
+            if not is_inside_repo:
+                # File is outside the repo, calculate destination path
+                rel_path_from_source = file_path.relative_to(self.source_dir)
+                dest_path = (self.repo_root / rel_path_from_source).resolve()
+                git_file_path_rel_repo = dest_path.relative_to(self.repo_root)
+
                 # Create parent directories if they don't exist
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                
+
                 # Copy the file
                 shutil.copy2(file_path, dest_path)
-                
-                # Use the destination path for git operations
-                git_file_path = rel_path
+                logger.debug(f"Copied {file_path} to {dest_path}")
             else:
-                # Use relative path for git operations if source_dir is the same as git_dir
-                git_file_path = file_path.relative_to(self.git_dir)
-            
-            # Add the file to git
-            self.repo.git.add(str(git_file_path))
-            
-            # Check if there are changes to commit
-            if not self.repo.is_dirty():
-                logger.info(f"No changes to commit for {git_file_path}")
-                return True
-            
+                # File is already inside the repo structure
+                git_file_path_rel_repo = file_path.relative_to(self.repo_root)
+
+            # Add the file to git using path relative to repo root
+            self.repo.git.add(str(git_file_path_rel_repo))
+
+            # Check if there are changes to commit (index differs from HEAD)
+            # Use the relative path for diff check as well
+            if not self.repo.index.diff("HEAD", paths=[str(git_file_path_rel_repo)]):
+                 logger.info(f"No staged changes to commit for {git_file_path_rel_repo}")
+                 # Even if no staged changes, check if untracked (newly added file)
+                 if str(git_file_path_rel_repo) in self.repo.untracked_files:
+                     logger.info(f"File {git_file_path_rel_repo} is untracked, proceeding with commit.")
+                 else:
+                     return True # Assume already committed or no changes
+
+
             # Commit the file
-            commit_message = f"Add {git_file_path}"
+            commit_message = f"Add {git_file_path_rel_repo}"
             self.repo.git.commit('-m', commit_message)
-            
-            logger.info(f"Committed file: {git_file_path}")
+
+            logger.info(f"Committed file: {git_file_path_rel_repo}")
             
             # Push changes if requested
             if self.commit_push:
@@ -193,30 +213,36 @@ class GitSyncer:
                 for file_path in new_files:
                     # Resolve the file path to handle symlinks
                     file_path = file_path.resolve()
-                    
-                    if self.source_dir != self.git_dir:
-                        # Copy file to git_dir if source_dir is different
-                        rel_path = file_path.relative_to(self.source_dir)
-                        dest_path = (self.git_dir / rel_path).resolve()
-                        
+
+                    # Determine if the file is inside the repo or needs copying
+                    is_inside_repo = self.repo_root in file_path.parents or self.repo_root == file_path.parent
+
+                    if not is_inside_repo:
+                        # File is outside the repo, calculate destination path
+                        rel_path_from_source = file_path.relative_to(self.source_dir)
+                        dest_path = (self.repo_root / rel_path_from_source).resolve()
+                        git_file_path_rel_repo = dest_path.relative_to(self.repo_root)
+
                         # Create parent directories if they don't exist
                         dest_path.parent.mkdir(parents=True, exist_ok=True)
-                        
+
                         # Copy the file
                         shutil.copy2(file_path, dest_path)
-                        
-                        # Add the file to git
-                        self.repo.git.add(str(rel_path))
+                        logger.debug(f"Copied {file_path} to {dest_path}")
+
+                        # Add the file to git using path relative to repo root
+                        self.repo.git.add(str(git_file_path_rel_repo))
                     else:
-                        # Add file directly in git_dir
-                        rel_path = file_path.relative_to(self.git_dir)
-                        self.repo.git.add(str(rel_path))
+                        # File is already inside the repo structure
+                        git_file_path_rel_repo = file_path.relative_to(self.repo_root)
+                        self.repo.git.add(str(git_file_path_rel_repo))
                 
-                # Check if there are changes to commit
-                if self.repo.is_dirty() or self.repo.untracked_files:
+                # Check if there are staged changes or untracked files before committing
+                if self.repo.is_dirty(index=True, working_tree=False) or self.repo.untracked_files:
                     # Commit all added files
                     self.repo.git.commit('-m', "Add new files")
-                    
+                    logger.info(f"Committed batch of {len(new_files)} files.")
+
                     # Push changes if requested
                     if self.commit_push:
                         self._push()

@@ -210,7 +210,7 @@ class TestGitSyncer(unittest.TestCase):
             self.assertTrue(os.path.exists(git_file))
             
             # Verify the absolute path correctly resolved from relative path
-            self.assertEqual(syncer.git_dir, Path(git_dir).resolve())
+            self.assertEqual(syncer.repo_root, Path(git_dir).resolve())
             
         finally:
             # Restore original working directory and clean up
@@ -270,7 +270,7 @@ class TestGitSyncer(unittest.TestCase):
             
             # Verify the absolute paths correctly resolved from relative paths
             self.assertEqual(syncer.source_dir, Path(source_dir).resolve())
-            self.assertEqual(syncer.git_dir, Path(git_dir).resolve())
+            self.assertEqual(syncer.repo_root, Path(git_dir).resolve())
             
         finally:
             # Restore original working directory and clean up
@@ -332,7 +332,7 @@ class TestGitSyncer(unittest.TestCase):
             
             # Verify the absolute paths correctly resolved from relative paths
             self.assertEqual(syncer.source_dir, Path(parent_dir).resolve())
-            self.assertEqual(syncer.git_dir, Path(git_dir).resolve())
+            self.assertEqual(syncer.repo_root, Path(git_dir).resolve())
             
         finally:
             # Restore original working directory and clean up
@@ -550,6 +550,108 @@ class TestGitSyncer(unittest.TestCase):
         shutil.rmtree(remote_path, ignore_errors=True)
         shutil.rmtree(clone_path, ignore_errors=True)
     
+    def test_batch_commits_same_directory(self):
+        """Test batch commits when source_dir and git_dir are the same."""
+        test_dir = tempfile.mkdtemp()
+        try:
+            # Initialize git repo
+            repo = git.Repo.init(test_dir)
+            repo.config_writer().set_value("user", "name", "Test User").release()
+            repo.config_writer().set_value("user", "email", "test@example.com").release()
+
+            # Create initial commit
+            readme_path = os.path.join(test_dir, "README.md")
+            with open(readme_path, "w") as f:
+                f.write("# Test Repo")
+            repo.git.add("README.md")
+            repo.git.commit("-m", "Initial commit")
+
+            # Create multiple files directly in the repo directory
+            for i in range(3):
+                file_path = os.path.join(test_dir, f"batch_file{i}.txt")
+                with open(file_path, "w") as f:
+                    f.write(f"Batch content {i}")
+
+            # Initialize GitSyncer with same directory and batch mode
+            syncer = GitSyncer(
+                source_dir=test_dir,
+                git_dir=test_dir,
+                commit_push=False,
+                auto_pull=False,
+                per_file=False # Batch mode
+            )
+
+            # Process new files
+            syncer.process_new_files()
+
+            # Check if all files were added in a single commit
+            for i in range(3):
+                git_file = os.path.join(test_dir, f"batch_file{i}.txt")
+                self.assertTrue(os.path.exists(git_file))
+
+            # Verify there's only one commit (plus the initial one)
+            commit_count = sum(1 for _ in repo.iter_commits())
+            self.assertEqual(commit_count, 2) # Initial + Batch commit
+
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_commit_push_same_directory(self):
+        """Test commit and push when source_dir and git_dir are the same."""
+        local_repo_path = tempfile.mkdtemp()
+        remote_path = tempfile.mkdtemp()
+        clone_path = tempfile.mkdtemp()
+
+        try:
+            # Initialize remote bare repo
+            remote_repo = git.Repo.init(remote_path, bare=True)
+
+            # Initialize local repo
+            local_repo = git.Repo.init(local_repo_path)
+            local_repo.config_writer().set_value("user", "name", "Local User").release()
+            local_repo.config_writer().set_value("user", "email", "local@example.com").release()
+
+            # Add remote
+            local_repo.create_remote('origin', remote_path)
+
+            # Initial commit and push to set upstream
+            readme_path = os.path.join(local_repo_path, "README.md")
+            with open(readme_path, "w") as f:
+                f.write("# Local Repo")
+            local_repo.git.add("README.md")
+            local_repo.git.commit("-m", "Initial commit")
+            local_repo.git.push('--set-upstream', 'origin', local_repo.active_branch.name)
+
+            # Create a test file directly in the local repo directory
+            test_file = os.path.join(local_repo_path, "push_same_dir_test.txt")
+            with open(test_file, "w") as f:
+                f.write("Testing commit and push in same directory")
+
+            # Initialize GitSyncer with same directory and commit_push=True
+            syncer = GitSyncer(
+                source_dir=local_repo_path,
+                git_dir=local_repo_path,
+                commit_push=True, # Enable pushing
+                auto_pull=False,
+                per_file=True
+            )
+
+            # Process new files (which should commit and push)
+            syncer.process_new_files()
+
+            # Clone the remote repo to verify the push worked
+            cloned_repo = git.Repo.clone_from(remote_path, clone_path)
+
+            # Check if the file exists in the cloned repo
+            cloned_file = os.path.join(clone_path, "push_same_dir_test.txt")
+            self.assertTrue(os.path.exists(cloned_file))
+
+        finally:
+            # Clean up
+            shutil.rmtree(local_repo_path, ignore_errors=True)
+            shutil.rmtree(remote_path, ignore_errors=True)
+            shutil.rmtree(clone_path, ignore_errors=True)
+    
     def test_error_handling(self):
         """Test error handling for invalid directories"""
         with self.assertRaises(FileNotFoundError):
@@ -585,6 +687,61 @@ class TestGitSyncer(unittest.TestCase):
         
         # Clean up
         shutil.rmtree(non_repo_dir, ignore_errors=True)
+    
+    def test_git_dir_is_subdir(self):
+        """Test handling when git_dir is a subdirectory of the actual git repository."""
+        # Create base directory and subdirectory structure
+        base_dir = tempfile.mkdtemp()
+        repo_root = os.path.join(base_dir, "repo_root")
+        subdir = os.path.join(repo_root, "data", "subdir")
+        os.makedirs(subdir)
+
+        # Initialize git repo in repo_root
+        repo = git.Repo.init(repo_root)
+        repo.config_writer().set_value("user", "name", "Test User").release()
+        repo.config_writer().set_value("user", "email", "test@example.com").release()
+
+        # Create initial commit in repo_root
+        readme_path = os.path.join(repo_root, "README.md")
+        with open(readme_path, "w") as f:
+            f.write("# Main Repo")
+        repo.git.add("README.md")
+        repo.git.commit("-m", "Initial commit in root")
+
+        # Create a test file in the subdirectory
+        test_file_path = os.path.join(subdir, "sub_test.txt")
+        with open(test_file_path, "w") as f:
+            f.write("Content in subdirectory")
+
+        # Initialize GitSyncer pointing git_dir to the subdirectory
+        # This should ideally discover the repo at repo_root
+        syncer = GitSyncer(
+            source_dir=subdir,  # Source is the subdir
+            git_dir=subdir,     # Git dir points to the subdir too
+            commit_push=False,
+            auto_pull=False,
+            per_file=True
+        )
+
+        # Assert that the syncer found the correct repository root
+        self.assertEqual(Path(syncer.repo.working_dir), Path(repo_root).resolve())
+
+        # Process new files
+        syncer.process_new_files()
+
+        # Verify the file was committed correctly relative to the repo root
+        git_file_rel_path = os.path.join("data", "subdir", "sub_test.txt")
+        git_file_abs_path = os.path.join(repo_root, git_file_rel_path)
+
+        self.assertTrue(os.path.exists(git_file_abs_path))
+
+        # Check commit history for the file addition relative to root
+        commit_messages = [commit.message for commit in repo.iter_commits()]
+        expected_commit_message = f"Add {Path(git_file_rel_path)}" # Path ensures correct separators
+        self.assertIn(expected_commit_message, commit_messages[0]) # Check latest commit
+
+        # Clean up
+        shutil.rmtree(base_dir, ignore_errors=True)
     
     def test_file_modifications(self):
         """Test syncing modified files"""
