@@ -14,7 +14,7 @@ A lightweight, flexible tool for synchronizing files between directories and git
 ## Usage
 
 ```
-nix run .#syng -- --source_dir /path/to/source --git_dir /path/to/repo [options]
+nix run github:willyrgf/syng -- --source_dir /path/to/source --git_dir /path/to/repo [options]
 ```
 
 ## Installation
