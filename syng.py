@@ -58,19 +58,33 @@ class GitSyncer:
             raise ValueError(f"Could not find a git repository at or above: {self._original_git_dir}")
     
     def pull(self) -> bool:
-        """Pull changes from remote repository."""
+        """Pull changes from remote repository, handling CWD changes."""
         if not self.auto_pull:
             return True
-            
+
+        original_cwd = os.getcwd()
         try:
+            # Change CWD to repo root before pulling
+            os.chdir(self.repo_root)
+            logger.info(f"Temporarily changed CWD to {self.repo_root} for pull")
+
             for remote in self.repo.remotes:
                 logger.info(f"Pulling from remote: {remote.name}")
-                fetch_info = remote.pull(ff_only=True)
-                logger.info(f"Pull result: {fetch_info}")
+                # Using repo.git.pull directly for potentially better error handling/info
+                # and ensures it runs within the correct CWD context
+                pull_output = self.repo.git.pull(remote.name, self.repo.active_branch.name, '-v', '--ff-only')
+                logger.info(f"Pull result for {remote.name}: {pull_output}")
             return True
         except git.GitCommandError as e:
             logger.error(f"Failed to pull changes: {e}")
             return False
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during pull: {e}")
+            return False
+        finally:
+            # Ensure CWD is restored
+            os.chdir(original_cwd)
+            logger.info(f"Restored CWD to {original_cwd}")
     
     def find_new_files(self) -> Set[Path]:
         """Find new files in source_dir that haven't been processed yet."""

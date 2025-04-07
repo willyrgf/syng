@@ -12,9 +12,14 @@ import git
 import logging
 
 # Set logging level to reduce output
-logging.getLogger('syng').setLevel(logging.DEBUG)
+# Only show errors and critical messages during tests
+logging.getLogger('syng').setLevel(logging.WARNING)
+logging.getLogger('git.cmd').setLevel(logging.WARNING) # Silence GitPython command logging too
 
 # Import the GitSyncer class directly from the syng.py script in the root
+# Assume syng.py is in the parent directory relative to the test file location
+script_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(script_dir))
 from syng import GitSyncer
 
 class TestGitSyncer(unittest.TestCase):
@@ -446,7 +451,7 @@ class TestGitSyncer(unittest.TestCase):
         shutil.rmtree(local_repo_path, ignore_errors=True)
         shutil.rmtree(remote_repo_path, ignore_errors=True)
         shutil.rmtree(external_repo_path, ignore_errors=True)
-        
+    
     def test_nested_directories(self):
         """Test syncing files in nested directories"""
         # Create a nested directory structure in source
@@ -777,6 +782,104 @@ class TestGitSyncer(unittest.TestCase):
             content = f.read()
         self.assertEqual(content, "Modified content")
 
-if __name__ == "__main__":
-    # Run all tests
-    unittest.main() 
+    def test_auto_pull_outside_repo_cwd(self):
+        """Test auto-pull when CWD is outside the git_dir, using local remotes."""
+        # Define logger for this test method
+        logger = logging.getLogger('syng')
+
+        original_cwd = os.getcwd()
+        base_temp_dir = tempfile.mkdtemp() # Base for all test dirs
+
+        repo_a_path = os.path.join(base_temp_dir, "repo_a")
+        remote_b_path = os.path.join(base_temp_dir, "remote_b.git")
+        repo_c_path = os.path.join(base_temp_dir, "repo_c")
+        outside_cwd_path = os.path.join(base_temp_dir, "outside_cwd")
+
+        os.makedirs(repo_a_path)
+        os.makedirs(repo_c_path)
+        os.makedirs(outside_cwd_path)
+
+        try:
+            # 1. Init bare remote repo B
+            git.Repo.init(remote_b_path, bare=True)
+            logger.debug(f"Initialized bare repo at {remote_b_path}")
+
+            # 2. Init repo A, add remote B, commit & push initial file
+            repo_a = git.Repo.init(repo_a_path)
+            repo_a.config_writer().set_value("user", "name", "Repo A User").release()
+            repo_a.config_writer().set_value("user", "email", "repo_a@example.com").release()
+            repo_a.create_remote('origin', remote_b_path)
+            
+            readme_a_path = os.path.join(repo_a_path, "README.md")
+            with open(readme_a_path, "w") as f: f.write("Initial content from A")
+            repo_a.git.add("README.md")
+            repo_a.git.commit("-m", "Initial commit from A")
+            repo_a.git.push('origin', repo_a.active_branch.name)
+            logger.debug(f"Initialized repo A at {repo_a_path}, pushed initial commit")
+
+            # 3. Clone repo B into repo C
+            repo_c = git.Repo.clone_from(remote_b_path, repo_c_path)
+            repo_c.config_writer().set_value("user", "name", "Repo C User").release()
+            repo_c.config_writer().set_value("user", "email", "repo_c@example.com").release()
+            logger.debug(f"Cloned remote B into repo C at {repo_c_path}")
+
+            # 4. Make a change in repo A and push it to remote B
+            update_file_path = os.path.join(repo_a_path, "update.txt")
+            with open(update_file_path, "w") as f: f.write("Update from A")
+            repo_a.git.add("update.txt")
+            repo_a.git.commit("-m", "Add update file from A")
+            repo_a.git.push('origin', repo_a.active_branch.name)
+            logger.debug("Pushed update from repo A to remote B")
+
+            # 5. Change CWD to be outside repo C
+            os.chdir(outside_cwd_path)
+            logger.debug(f"Changed CWD to {os.getcwd()}")
+
+            # 6. Initialize GitSyncer targeting repo C, with auto_pull=True
+            syncer = GitSyncer(
+                source_dir=repo_c_path, # Doesn't matter much for this test
+                git_dir=repo_c_path,    # Target repo C
+                commit_push=False,
+                auto_pull=True,         # Enable pull
+                per_file=False
+            )
+            logger.debug("Initialized GitSyncer targeting repo C from outside CWD")
+
+            # 7. Trigger the pull mechanism (directly call pull or via process_new_files)
+            # We need a new file in source_dir to trigger process_new_files -> pull
+            # Or we can just call pull() directly for this specific test
+            pull_successful = syncer.pull()
+            logger.debug(f"Called syncer.pull(), success={pull_successful}")
+
+            # 8. Assert that the pull was successful and the update file is now in repo C
+            self.assertTrue(pull_successful, "Pull should succeed even when CWD is outside")
+            
+            pulled_update_file = os.path.join(repo_c_path, "update.txt")
+            self.assertTrue(os.path.exists(pulled_update_file), 
+                            "Update file from remote B was not pulled into repo C")
+            with open(pulled_update_file, 'r') as f:
+                content = f.read()
+            self.assertEqual(content, "Update from A")
+            logger.debug("Verified update file exists in repo C after pull")
+
+        finally:
+            # Restore CWD and clean up
+            os.chdir(original_cwd)
+            shutil.rmtree(base_temp_dir, ignore_errors=True)
+            logger.debug(f"Restored CWD to {original_cwd} and cleaned up {base_temp_dir}")
+
+if __name__ == '__main__':
+    # Ensure the script can find syng.py when run directly
+    # This might be needed if running tests via `python test_syng.py`
+    current_dir = Path(__file__).parent
+    if str(current_dir.parent) not in sys.path:
+        sys.path.insert(0, str(current_dir.parent))
+    
+    # Re-import after potentially modifying sys.path
+    try:
+        from syng import GitSyncer
+    except ImportError:
+        print("Error: Could not import GitSyncer. Make sure syng.py is in the parent directory.")
+        sys.exit(1)
+        
+    unittest.main()
