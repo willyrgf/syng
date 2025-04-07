@@ -1,13 +1,15 @@
 # Syng
 
-Syng is a synchronization tool that maintains a persistent layer a source directory and a git repository.
+A lightweight, flexible tool for synchronizing files between directories and git repositories. Syng automates the process of monitoring directories for changes and committing them to a git repository, with configurable behaviors for committing, pushing, and pulling changes.
 
-## Features
+## Key Features
+- Bi-directional sync between directories and git repositories
+- Per-file or batch commit options
+- Automatic pull capabilities to stay in sync with remote changes
+- Optional push on commit for immediate synchronization
+- Support for nested directory structures
+- Non-invasive monitoring with low CPU usage
 
-- **Forward-only sync**: Watches for new files in the source directory and commits them to the git repository
-- **Automatic pull**: Keeps the git repository updated, avoiding conflicts
-- **Per-file commits**: Option to create a separate commit for each file
-- **Configurable directories**: Supports syncing between different source and git directories
 
 ## Usage
 
