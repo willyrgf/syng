@@ -25,8 +25,8 @@ class GitSyncer:
         auto_pull: bool = False,
         per_file: bool = False
     ):
-        self.source_dir = Path(source_dir).absolute()
-        self.git_dir = Path(git_dir).absolute()
+        self.source_dir = Path(source_dir).resolve()
+        self.git_dir = Path(git_dir).resolve()
         self.commit_push = commit_push
         self.auto_pull = auto_pull
         self.per_file = per_file
@@ -68,13 +68,13 @@ class GitSyncer:
         """Find new files in source_dir that haven't been processed yet."""
         current_files = set()
         for root, _, files in os.walk(self.source_dir):
-            root_path = Path(root)
+            root_path = Path(root).resolve()
             # Skip .git directory if source_dir is same as git_dir
             if ".git" in root_path.parts:
                 continue
                 
             for file in files:
-                file_path = root_path / file
+                file_path = (root_path / file).resolve()
                 if file_path.is_file():
                     # Get path relative to source_dir
                     if self.source_dir == self.git_dir:
@@ -93,10 +93,13 @@ class GitSyncer:
     def commit_file(self, file_path: Path) -> bool:
         """Commit a single file to the git repository."""
         try:
+            # Resolve the file path to handle symlinks
+            file_path = file_path.resolve()
+            
             if self.source_dir != self.git_dir:
                 # Copy file to git_dir if source_dir is different
                 rel_path = file_path.relative_to(self.source_dir)
-                dest_path = self.git_dir / rel_path
+                dest_path = (self.git_dir / rel_path).resolve()
                 
                 # Create parent directories if they don't exist
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,10 +191,13 @@ class GitSyncer:
             try:
                 # Add all files at once
                 for file_path in new_files:
+                    # Resolve the file path to handle symlinks
+                    file_path = file_path.resolve()
+                    
                     if self.source_dir != self.git_dir:
                         # Copy file to git_dir if source_dir is different
                         rel_path = file_path.relative_to(self.source_dir)
-                        dest_path = self.git_dir / rel_path
+                        dest_path = (self.git_dir / rel_path).resolve()
                         
                         # Create parent directories if they don't exist
                         dest_path.parent.mkdir(parents=True, exist_ok=True)

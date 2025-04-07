@@ -62,7 +62,8 @@ class TestGitSyncer(unittest.TestCase):
         
         # Verify that the new file was found
         self.assertEqual(len(new_files), 1)
-        self.assertEqual(Path(test_file), list(new_files)[0])
+        # Use resolve() on both sides to handle symlinks (like /tmp vs /private/tmp) correctly
+        self.assertEqual(Path(test_file).resolve(), list(new_files)[0].resolve())
     
     def test_commit_file(self):
         # Create a new file in the source directory
@@ -80,7 +81,7 @@ class TestGitSyncer(unittest.TestCase):
         )
         
         # Commit the file
-        result = syncer.commit_file(Path(test_file))
+        result = syncer.commit_file(Path(test_file).resolve())
         
         # Verify that the commit was successful
         self.assertTrue(result)
@@ -92,6 +93,251 @@ class TestGitSyncer(unittest.TestCase):
         # Check if the file is in the git history
         commit_message = syncer.repo.head.commit.message
         self.assertIn("Add test.txt", commit_message)
+    
+    def test_relative_path_source_dir(self):
+        """Test handling of relative paths for source directory"""
+        # Save current working directory
+        original_cwd = os.getcwd()
+
+        try:
+            # Create a temporary directory structure
+            base_dir = tempfile.mkdtemp()
+            source_dir = os.path.join(base_dir, "source")
+            git_dir = os.path.join(base_dir, "git_repo")
+            
+            # Create the directories
+            os.makedirs(source_dir)
+            os.makedirs(git_dir)
+            
+            # Initialize git repo
+            repo = git.Repo.init(git_dir)
+            repo.config_writer().set_value("user", "name", "Test User").release()
+            repo.config_writer().set_value("user", "email", "test@example.com").release()
+            
+            # Create initial commit
+            readme_path = os.path.join(git_dir, "README.md")
+            with open(readme_path, "w") as f:
+                f.write("# Test Repository")
+            repo.git.add("README.md")
+            repo.git.commit("-m", "Initial commit")
+            
+            # Create a test file in the source directory
+            test_file = os.path.join(source_dir, "test.txt")
+            with open(test_file, "w") as f:
+                f.write("Test content")
+            
+            # Change working directory to base_dir
+            os.chdir(base_dir)
+            
+            # Initialize GitSyncer with relative paths
+            syncer = GitSyncer(
+                source_dir="./source",  # Relative path
+                git_dir=git_dir,  # Absolute path
+                commit_push=False,
+                auto_pull=False,
+                per_file=True
+            )
+            
+            # Process new files
+            syncer.process_new_files()
+            
+            # Check if the file was copied to the git directory
+            git_file = os.path.join(git_dir, "test.txt")
+            self.assertTrue(os.path.exists(git_file))
+            
+            # Check the content
+            with open(git_file, "r") as f:
+                content = f.read()
+            self.assertEqual(content, "Test content")
+            
+            # Verify the absolute path correctly resolved from relative path
+            self.assertEqual(syncer.source_dir, Path(source_dir).resolve())
+            
+        finally:
+            # Restore original working directory and clean up
+            os.chdir(original_cwd)
+            shutil.rmtree(base_dir, ignore_errors=True)
+    
+    def test_relative_path_git_dir(self):
+        """Test handling of relative paths for git directory"""
+        # Save current working directory
+        original_cwd = os.getcwd()
+
+        try:
+            # Create a temporary directory structure
+            base_dir = tempfile.mkdtemp()
+            source_dir = os.path.join(base_dir, "source")
+            git_dir = os.path.join(base_dir, "git_repo")
+            
+            # Create the directories
+            os.makedirs(source_dir)
+            os.makedirs(git_dir)
+            
+            # Initialize git repo
+            repo = git.Repo.init(git_dir)
+            repo.config_writer().set_value("user", "name", "Test User").release()
+            repo.config_writer().set_value("user", "email", "test@example.com").release()
+            
+            # Create initial commit
+            readme_path = os.path.join(git_dir, "README.md")
+            with open(readme_path, "w") as f:
+                f.write("# Test Repository")
+            repo.git.add("README.md")
+            repo.git.commit("-m", "Initial commit")
+            
+            # Create a test file in the source directory
+            test_file = os.path.join(source_dir, "test.txt")
+            with open(test_file, "w") as f:
+                f.write("Test content")
+            
+            # Change working directory to base_dir
+            os.chdir(base_dir)
+            
+            # Initialize GitSyncer with relative paths
+            syncer = GitSyncer(
+                source_dir=source_dir,  # Absolute path
+                git_dir="./git_repo",  # Relative path
+                commit_push=False,
+                auto_pull=False,
+                per_file=True
+            )
+            
+            # Process new files
+            syncer.process_new_files()
+            
+            # Check if the file was copied to the git directory
+            git_file = os.path.join(git_dir, "test.txt")
+            self.assertTrue(os.path.exists(git_file))
+            
+            # Verify the absolute path correctly resolved from relative path
+            self.assertEqual(syncer.git_dir, Path(git_dir).resolve())
+            
+        finally:
+            # Restore original working directory and clean up
+            os.chdir(original_cwd)
+            shutil.rmtree(base_dir, ignore_errors=True)
+    
+    def test_both_relative_paths(self):
+        """Test handling when both source and git directories are specified as relative paths"""
+        # Save current working directory
+        original_cwd = os.getcwd()
+
+        try:
+            # Create a temporary directory structure
+            base_dir = tempfile.mkdtemp()
+            source_dir = os.path.join(base_dir, "source")
+            git_dir = os.path.join(base_dir, "git_repo")
+            
+            # Create the directories
+            os.makedirs(source_dir)
+            os.makedirs(git_dir)
+            
+            # Initialize git repo
+            repo = git.Repo.init(git_dir)
+            repo.config_writer().set_value("user", "name", "Test User").release()
+            repo.config_writer().set_value("user", "email", "test@example.com").release()
+            
+            # Create initial commit
+            readme_path = os.path.join(git_dir, "README.md")
+            with open(readme_path, "w") as f:
+                f.write("# Test Repository")
+            repo.git.add("README.md")
+            repo.git.commit("-m", "Initial commit")
+            
+            # Create a test file in the source directory
+            test_file = os.path.join(source_dir, "test.txt")
+            with open(test_file, "w") as f:
+                f.write("Test content")
+            
+            # Change working directory to base_dir
+            os.chdir(base_dir)
+            
+            # Initialize GitSyncer with relative paths for both directories
+            syncer = GitSyncer(
+                source_dir="./source",  # Relative path
+                git_dir="./git_repo",   # Relative path
+                commit_push=False,
+                auto_pull=False,
+                per_file=True
+            )
+            
+            # Process new files
+            syncer.process_new_files()
+            
+            # Check if the file was copied to the git directory
+            git_file = os.path.join(git_dir, "test.txt")
+            self.assertTrue(os.path.exists(git_file))
+            
+            # Verify the absolute paths correctly resolved from relative paths
+            self.assertEqual(syncer.source_dir, Path(source_dir).resolve())
+            self.assertEqual(syncer.git_dir, Path(git_dir).resolve())
+            
+        finally:
+            # Restore original working directory and clean up
+            os.chdir(original_cwd)
+            shutil.rmtree(base_dir, ignore_errors=True)
+    
+    def test_parent_relative_path(self):
+        """Test handling of parent directory notation in relative paths (../)"""
+        # Save current working directory
+        original_cwd = os.getcwd()
+
+        try:
+            # Create a temporary directory structure
+            base_dir = tempfile.mkdtemp()
+            parent_dir = os.path.join(base_dir, "parent")
+            child_dir = os.path.join(parent_dir, "child")
+            git_dir = os.path.join(parent_dir, "git_repo")
+            
+            # Create the directories
+            os.makedirs(parent_dir)
+            os.makedirs(child_dir)
+            os.makedirs(git_dir)
+            
+            # Initialize git repo
+            repo = git.Repo.init(git_dir)
+            repo.config_writer().set_value("user", "name", "Test User").release()
+            repo.config_writer().set_value("user", "email", "test@example.com").release()
+            
+            # Create initial commit
+            readme_path = os.path.join(git_dir, "README.md")
+            with open(readme_path, "w") as f:
+                f.write("# Test Repository")
+            repo.git.add("README.md")
+            repo.git.commit("-m", "Initial commit")
+            
+            # Create a test file in the parent directory
+            test_file = os.path.join(parent_dir, "test.txt")
+            with open(test_file, "w") as f:
+                f.write("Test content")
+            
+            # Change working directory to child_dir
+            os.chdir(child_dir)
+            
+            # Initialize GitSyncer with relative path that goes up one level
+            syncer = GitSyncer(
+                source_dir="..",  # Parent directory
+                git_dir="../git_repo",
+                commit_push=False,
+                auto_pull=False,
+                per_file=True
+            )
+            
+            # Process new files
+            syncer.process_new_files()
+            
+            # Check if the file was copied to the git directory
+            git_file = os.path.join(git_dir, "test.txt")
+            self.assertTrue(os.path.exists(git_file))
+            
+            # Verify the absolute paths correctly resolved from relative paths
+            self.assertEqual(syncer.source_dir, Path(parent_dir).resolve())
+            self.assertEqual(syncer.git_dir, Path(git_dir).resolve())
+            
+        finally:
+            # Restore original working directory and clean up
+            os.chdir(original_cwd)
+            shutil.rmtree(base_dir, ignore_errors=True)
     
     def test_same_directory(self):
         # Initialize git repo in a new directory for this test
