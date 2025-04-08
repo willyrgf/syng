@@ -36,6 +36,7 @@ class GitSyncer:
         self.pull_interval = pull_interval
         self._stop_event: Optional[threading.Event] = None
         self.processed_files: Set[Path] = set()
+        self._git_lock = threading.Lock() # Add lock for git operations
         
         logger.info(f"Initializing GitSyncer with source_dir={self.source_dir}, git_dir={self._original_git_dir}")
         logger.info(f"Options: commit_push={commit_push}, auto_pull={auto_pull}, per_file={per_file}, pull_interval={pull_interval}")
@@ -77,29 +78,36 @@ class GitSyncer:
         if not self.auto_pull:
             return True
 
-        original_cwd = os.getcwd()
-        try:
-            # Change CWD to repo root before pulling
-            os.chdir(self.repo_root)
-            logger.info(f"Temporarily changed CWD to {self.repo_root} for pull")
+        # Acquire lock before interacting with the repo
+        logger.debug("Attempting to acquire git lock for pull...")
+        with self._git_lock:
+            logger.debug("Acquired git lock for pull.")
+            original_cwd = os.getcwd()
+            success = False # Track success within the locked block
+            try:
+                # Change CWD to repo root before pulling
+                os.chdir(self.repo_root)
+                logger.info(f"Temporarily changed CWD to {self.repo_root} for pull")
 
-            for remote in self.repo.remotes:
-                logger.info(f"Pulling from remote: {remote.name}")
-                # Using repo.git.pull directly for potentially better error handling/info
-                # and ensures it runs within the correct CWD context
-                pull_output = self.repo.git.pull(remote.name, self.repo.active_branch.name, '-v', '--ff-only')
-                logger.info(f"Pull result for {remote.name}: {pull_output}")
-            return True
-        except git.GitCommandError as e:
-            logger.error(f"Failed to pull changes: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during pull: {e}")
-            return False
-        finally:
-            # Ensure CWD is restored
-            os.chdir(original_cwd)
-            logger.info(f"Restored CWD to {original_cwd}")
+                for remote in self.repo.remotes:
+                    logger.info(f"Pulling from remote: {remote.name}")
+                    # Using repo.git.pull directly for potentially better error handling/info
+                    # and ensures it runs within the correct CWD context
+                    pull_output = self.repo.git.pull(remote.name, self.repo.active_branch.name, '-v', '--ff-only')
+                    logger.info(f"Pull result for {remote.name}: {pull_output}")
+                success = True
+            except git.GitCommandError as e:
+                logger.error(f"Failed to pull changes: {e}")
+                success = False
+            except Exception as e:
+                logger.error(f"An unexpected error occurred during pull: {e}")
+                success = False
+            finally:
+                # Ensure CWD is restored
+                os.chdir(original_cwd)
+                logger.info(f"Restored CWD to {original_cwd}")
+                logger.debug("Released git lock after pull.")
+        return success
     
     def find_new_files(self) -> Set[Path]:
         """Find new files in source_dir that haven't been processed yet."""
@@ -133,64 +141,72 @@ class GitSyncer:
     
     def commit_file(self, file_path: Path) -> bool:
         """Commit a single file to the git repository."""
-        try:
-            # Resolve the file path to handle symlinks
-            file_path = file_path.resolve()
+        # Acquire lock before interacting with the repo
+        logger.debug(f"Attempting to acquire git lock for commit_file: {file_path.name}")
+        with self._git_lock:
+            logger.debug(f"Acquired git lock for commit_file: {file_path.name}")
+            try:
+                # Resolve the file path to handle symlinks
+                file_path = file_path.resolve()
 
-            # Determine if the file is inside the repo or needs copying
-            is_inside_repo = self.repo_root in file_path.parents or self.repo_root == file_path.parent
+                # Determine if the file is inside the repo or needs copying
+                is_inside_repo = self.repo_root in file_path.parents or self.repo_root == file_path.parent
 
-            if not is_inside_repo:
-                # File is outside the repo, calculate destination path
-                rel_path_from_source = file_path.relative_to(self.source_dir)
-                dest_path = (self.repo_root / rel_path_from_source).resolve()
-                git_file_path_rel_repo = dest_path.relative_to(self.repo_root)
+                if not is_inside_repo:
+                    # File is outside the repo, calculate destination path
+                    rel_path_from_source = file_path.relative_to(self.source_dir)
+                    dest_path = (self.repo_root / rel_path_from_source).resolve()
+                    git_file_path_rel_repo = dest_path.relative_to(self.repo_root)
 
-                # Create parent directories if they don't exist
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Create parent directories if they don't exist
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-                # Copy the file
-                shutil.copy2(file_path, dest_path)
-                logger.debug(f"Copied {file_path} to {dest_path}")
-            else:
-                # File is already inside the repo structure
-                git_file_path_rel_repo = file_path.relative_to(self.repo_root)
+                    # Copy the file
+                    shutil.copy2(file_path, dest_path)
+                    logger.debug(f"Copied {file_path} to {dest_path}")
+                else:
+                    # File is already inside the repo structure
+                    git_file_path_rel_repo = file_path.relative_to(self.repo_root)
 
-            # Add the file to git using path relative to repo root
-            self.repo.git.add(str(git_file_path_rel_repo))
+                # Add the file to git using path relative to repo root
+                self.repo.git.add(str(git_file_path_rel_repo))
 
-            # Check if there are changes to commit (index differs from HEAD)
-            # Use the relative path for diff check as well
-            if not self.repo.index.diff("HEAD", paths=[str(git_file_path_rel_repo)]):
-                 logger.info(f"No staged changes to commit for {git_file_path_rel_repo}")
-                 # Even if no staged changes, check if untracked (newly added file)
-                 if str(git_file_path_rel_repo) in self.repo.untracked_files:
-                     logger.info(f"File {git_file_path_rel_repo} is untracked, proceeding with commit.")
-                 else:
-                     return True # Assume already committed or no changes
+                # Check if there are changes to commit (index differs from HEAD)
+                # Use the relative path for diff check as well
+                if not self.repo.index.diff("HEAD", paths=[str(git_file_path_rel_repo)]):
+                     logger.info(f"No staged changes to commit for {git_file_path_rel_repo}")
+                     # Even if no staged changes, check if untracked (newly added file)
+                     if str(git_file_path_rel_repo) in self.repo.untracked_files:
+                         logger.info(f"File {git_file_path_rel_repo} is untracked, proceeding with commit.")
+                     else:
+                         return True # Assume already committed or no changes
 
 
-            # Commit the file
-            commit_message = f"Add {git_file_path_rel_repo}"
-            self.repo.git.commit('-m', commit_message)
+                # Commit the file
+                commit_message = f"Add {git_file_path_rel_repo}"
+                self.repo.git.commit('-m', commit_message)
 
-            logger.info(f"Committed file: {git_file_path_rel_repo}")
-            
-            # Push changes if requested
-            if self.commit_push:
-                self._push()
+                logger.info(f"Committed file: {git_file_path_rel_repo}")
                 
-            return True
-            
-        except git.GitCommandError as e:
-            logger.error(f"Git error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Error committing file {file_path}: {e}")
-            return False
+                # Push changes if requested
+                if self.commit_push:
+                    self._push() # _push is called within the locked block
+
+                return True
+
+            except git.GitCommandError as e:
+                logger.error(f"Git error processing {file_path.name}: {e}")
+                return False
+            except Exception as e:
+                logger.error(f"Error committing file {file_path.name}: {e}")
+                return False
+            finally:
+                logger.debug(f"Released git lock after commit_file: {file_path.name}")
     
     def _push(self) -> bool:
         """Push changes to remote repositories."""
+        # This method should only be called when the git lock is already held
+        # by the calling method (commit_file or process_new_files)
         try:
             for remote in self.repo.remotes:
                 logger.info(f"Pushing to remote: {remote.name}")
@@ -232,52 +248,94 @@ class GitSyncer:
                 if self.commit_file(file_path):
                     self.processed_files.add(file_path)
         else:
-            try:
-                # Add all files at once
-                for file_path in new_files:
-                    # Resolve the file path to handle symlinks
-                    file_path = file_path.resolve()
+            # --- Batch commit mode ---
+            files_to_add_rel: list[str] = []
+            copy_operations: list[tuple[Path, Path]] = []
+            commit_needed = False
 
-                    # Determine if the file is inside the repo or needs copying
+            # First pass: Identify files needing copy/add (no git interaction yet)
+            for file_path in new_files:
+                try:
+                    file_path = file_path.resolve()
                     is_inside_repo = self.repo_root in file_path.parents or self.repo_root == file_path.parent
 
                     if not is_inside_repo:
-                        # File is outside the repo, calculate destination path
                         rel_path_from_source = file_path.relative_to(self.source_dir)
                         dest_path = (self.repo_root / rel_path_from_source).resolve()
                         git_file_path_rel_repo = dest_path.relative_to(self.repo_root)
-
-                        # Create parent directories if they don't exist
-                        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-                        # Copy the file
-                        shutil.copy2(file_path, dest_path)
-                        logger.debug(f"Copied {file_path} to {dest_path}")
-
-                        # Add the file to git using path relative to repo root
-                        self.repo.git.add(str(git_file_path_rel_repo))
+                        copy_operations.append((file_path, dest_path))
                     else:
-                        # File is already inside the repo structure
                         git_file_path_rel_repo = file_path.relative_to(self.repo_root)
-                        self.repo.git.add(str(git_file_path_rel_repo))
-                
-                # Check if there are staged changes or untracked files before committing
-                if self.repo.is_dirty(index=True, working_tree=False) or self.repo.untracked_files:
-                    # Commit all added files
-                    self.repo.git.commit('-m', "Add new files")
-                    logger.info(f"Committed batch of {len(new_files)} files.")
 
-                    # Push changes if requested
-                    if self.commit_push:
-                        self._push()
-                    
-                # Mark all files as processed
-                self.processed_files.update(new_files)
-                
-            except git.GitCommandError as e:
-                logger.error(f"Git error: {e}")
-            except Exception as e:
-                logger.error(f"Error processing files: {e}")
+                    files_to_add_rel.append(str(git_file_path_rel_repo))
+                    commit_needed = True # Assume add/commit needed if files found
+                except Exception as e:
+                     logger.error(f"Error preparing file {file_path} for batch commit: {e}")
+                     # Skip this file but continue with others
+
+            if not commit_needed:
+                 logger.info("No new files identified for batch commit after preparation.")
+                 # Mark all original new_files as processed even if prep failed for some
+                 # This prevents reprocessing files that caused prep errors repeatedly
+                 self.processed_files.update(new_files)
+                 return # Exit process_new_files
+
+            # Acquire lock before performing git operations for the batch
+            logger.debug("Attempting to acquire git lock for batch commit...")
+            with self._git_lock:
+                logger.debug("Acquired git lock for batch commit.")
+                batch_success = False
+                processed_in_batch = set() # Track files successfully processed in this batch
+                try:
+                    # Perform copy operations
+                    for src, dest in copy_operations:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dest)
+                        logger.debug(f"Copied {src} to {dest}")
+
+                    # Add all prepared files at once
+                    if files_to_add_rel:
+                        self.repo.git.add(files_to_add_rel)
+                        logger.info(f"Staged {len(files_to_add_rel)} files for batch commit.")
+
+                    # Check if there are staged changes before committing
+                    # (is_dirty is expensive, use diff check)
+                    # Check index vs HEAD or if untracked files were added
+                    staged_changes = self.repo.index.diff("HEAD", paths=files_to_add_rel)
+                    added_untracked = any(f in self.repo.untracked_files for f in files_to_add_rel)
+
+                    if staged_changes or added_untracked:
+                        # Commit all added files
+                        self.repo.git.commit('-m', f"Add batch of {len(files_to_add_rel)} files")
+                        logger.info(f"Committed batch of {len(files_to_add_rel)} files.")
+
+                        # Push changes if requested
+                        if self.commit_push:
+                           self._push() # Called within lock
+
+                        batch_success = True # Commit/push successful
+                        processed_in_batch = new_files # Mark all as processed if batch commit worked
+
+                    else:
+                         logger.info("No changes staged for batch commit (files might already exist/be identical).")
+                         batch_success = True # No error, considered success
+                         processed_in_batch = new_files # Mark as processed
+
+
+                except git.GitCommandError as e:
+                    logger.error(f"Git error during batch processing: {e}")
+                    # Keep batch_success = False
+                except Exception as e:
+                    logger.error(f"Error during batch processing: {e}")
+                    # Keep batch_success = False
+                finally:
+                    # Mark files as processed ONLY if the git operations for the batch succeeded
+                    if batch_success and processed_in_batch:
+                         self.processed_files.update(processed_in_batch)
+                         logger.info(f"Successfully processed batch, marked {len(processed_in_batch)} files.")
+                    else:
+                         logger.warning("Batch processing failed or had no effect. Files will be retried.")
+                    logger.debug("Released git lock after batch commit.")
     
     def run(self) -> None:
         """Run the syncer in an infinite loop."""
