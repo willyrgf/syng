@@ -37,9 +37,11 @@ class GitSyncer:
         self._stop_event: Optional[threading.Event] = None
         self.processed_files: Set[Path] = set()
         self._git_lock = threading.Lock() # Add lock for git operations
+        # Determine if file watching is needed
+        self._should_watch_files = self.commit_push or self.per_file
         
         logger.info(f"Initializing GitSyncer with source_dir={self.source_dir}, git_dir={self._original_git_dir}")
-        logger.info(f"Options: commit_push={commit_push}, auto_pull={auto_pull}, per_file={per_file}, pull_interval={pull_interval}")
+        logger.info(f"Options: commit_push={commit_push}, auto_pull={auto_pull}, per_file={per_file}, pull_interval={pull_interval}, watch_files={self._should_watch_files}")
         
         # Ensure directories exist
         if not self.source_dir.exists():
@@ -338,22 +340,55 @@ class GitSyncer:
                     logger.debug("Released git lock after batch commit.")
     
     def run(self) -> None:
-        """Run the syncer in an infinite loop."""
+        """Run the syncer based on configuration."""
         try:
-            while True:
-                self.process_new_files()
-                # Sleep to avoid high CPU usage
-                time.sleep(5) # Keep the existing sleep for file checking
+            if self._should_watch_files:
+                logger.info("Starting file watching loop...")
+                while True:
+                    self.process_new_files()
+                    # Sleep to avoid high CPU usage
+                    time.sleep(5) # Keep the existing sleep for file checking
+            elif self.auto_pull and self._pull_thread and self._pull_thread.is_alive():
+                logger.info("Auto-pull enabled, but file watching is disabled. Keeping main thread alive for pull thread.")
+                # Keep the main thread alive while the pull thread runs
+                # Waiting on the stop event is a good way to allow clean shutdown
+                if self._stop_event:
+                    self._stop_event.wait() # Wait indefinitely until the event is set (e.g., by KeyboardInterrupt)
+                else:
+                    # Fallback if stop event wasn't created (shouldn't happen with pull thread)
+                    while self._pull_thread.is_alive():
+                        time.sleep(1)
+                logger.info("Pull thread finished or stop signal received.")
+            else:
+                logger.info("Neither file watching nor auto-pull is enabled or active. Exiting.")
+                # No background tasks, so we can just exit.
+                return # Explicitly return
+
         except KeyboardInterrupt:
-            logger.info("Syncer stopped by user")
+            logger.info("Syncer interrupted by user.")
+            # Signal the pull thread to stop if it exists and is running
             if self._stop_event:
                 logger.info("Signaling pull thread to stop...")
                 self._stop_event.set()
+            # If we were in the file watching loop, this exception breaks it.
+            # If we were waiting for the pull thread, this exception also breaks the wait.
         except Exception as e:
             logger.exception(f"Syncer stopped due to error: {e}")
             if self._stop_event:
                 self._stop_event.set() # Also signal stop on other errors
             sys.exit(1)
+        finally:
+             # Optional: Wait for the pull thread to actually finish if it was running
+             if self.auto_pull and self._pull_thread and self._pull_thread.is_alive():
+                 logger.info("Waiting for pull thread to terminate...")
+                 # Check if the current thread is the pull thread itself before joining
+                 if threading.current_thread() != self._pull_thread:
+                     self._pull_thread.join(timeout=5) # Wait max 5 seconds
+                     if self._pull_thread.is_alive():
+                         logger.warning("Pull thread did not terminate gracefully.")
+                 else:
+                     logger.info("Main thread is the pull thread, cannot join itself.")
+             logger.info("Syncer finished.")
 
     def _periodic_pull_worker(self, stop_event: threading.Event) -> None:
         """Worker function for the background pull thread."""
