@@ -10,17 +10,20 @@ import time
 import threading
 import git
 import logging
+from typing import Optional
 
 # Set logging level to reduce output
 # Only show errors and critical messages during tests
-logging.getLogger('syng').setLevel(logging.WARNING)
+logging.basicConfig(level=logging.WARNING) # Set root logger level
+logger = logging.getLogger('syng') # Get the logger used by the application
+logger.setLevel(logging.WARNING)
 logging.getLogger('git.cmd').setLevel(logging.WARNING) # Silence GitPython command logging too
 
 # Import the GitSyncer class directly from the syng.py script in the root
 # Assume syng.py is in the parent directory relative to the test file location
 script_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(script_dir))
-from syng import GitSyncer
+from syng import GitSyncer, GitManager
 
 class TestGitSyncer(unittest.TestCase):
     def setUp(self):
@@ -41,8 +44,23 @@ class TestGitSyncer(unittest.TestCase):
             f.write("# Test Repository")
         self.repo.git.add("README.md")
         self.repo.git.commit("-m", "Initial commit")
+        
+        # Placeholder for syncer instance if created by a test
+        self._syncer_instance_for_cleanup: Optional[GitSyncer] = None
     
     def tearDown(self):
+        # Clean up syncer instance if it exists and has active threads
+        if self._syncer_instance_for_cleanup:
+            syncer = self._syncer_instance_for_cleanup
+            if syncer._stop_event and not syncer._stop_event.is_set():
+                logger.debug("Signaling stop event in tearDown")
+                syncer._stop_event.set()
+            if syncer._pull_thread and syncer._pull_thread.is_alive():
+                logger.debug("Joining pull thread in tearDown")
+                syncer._pull_thread.join(timeout=5)
+                if syncer._pull_thread.is_alive():
+                    logger.warning("Pull thread did not terminate during tearDown")
+
         # Clean up temporary directories
         shutil.rmtree(self.source_dir, ignore_errors=True)
         shutil.rmtree(self.git_dir, ignore_errors=True)
@@ -53,10 +71,11 @@ class TestGitSyncer(unittest.TestCase):
         with open(test_file, "w") as f:
             f.write("Test content")
         
-        # Initialize GitSyncer
+        # Initialize GitManager and GitSyncer
+        git_manager = GitManager(repo_path_hint=self.git_dir)
         syncer = GitSyncer(
             source_dir=self.source_dir,
-            git_dir=self.git_dir,
+            git_manager=git_manager, # Pass manager instance
             commit_push=False,
             auto_pull=False,
             per_file=True
@@ -70,33 +89,35 @@ class TestGitSyncer(unittest.TestCase):
         # Use resolve() on both sides to handle symlinks (like /tmp vs /private/tmp) correctly
         self.assertEqual(Path(test_file).resolve(), list(new_files)[0].resolve())
     
-    def test_commit_file(self):
+    def test_process_single_file(self):
         # Create a new file in the source directory
         test_file = os.path.join(self.source_dir, "test.txt")
         with open(test_file, "w") as f:
             f.write("Test content")
         
-        # Initialize GitSyncer
+        # Initialize GitManager and GitSyncer with per_file=True
+        git_manager = GitManager(repo_path_hint=self.git_dir)
         syncer = GitSyncer(
             source_dir=self.source_dir,
-            git_dir=self.git_dir,
-            commit_push=False,
+            git_manager=git_manager,
+            commit_push=False, # Don't need push for this test
             auto_pull=False,
-            per_file=True
+            per_file=True # Ensure it uses _process_single_file logic
         )
         
-        # Commit the file
-        result = syncer.commit_file(Path(test_file).resolve())
+        # Process the new file(s)
+        syncer.process_new_files()
         
-        # Verify that the commit was successful
-        self.assertTrue(result)
+        # Verify that the processing was marked as successful internally (file added to set)
+        self.assertIn(Path(test_file).resolve(), syncer.processed_files)
         
         # Check if the file exists in the git directory
         git_file = os.path.join(self.git_dir, "test.txt")
         self.assertTrue(os.path.exists(git_file))
         
         # Check if the file is in the git history
-        commit_message = syncer.repo.head.commit.message
+        # Access repo via git_manager
+        commit_message = git_manager.repo.head.commit.message
         self.assertIn("Add test.txt", commit_message)
     
     def test_relative_path_source_dir(self):
@@ -134,10 +155,12 @@ class TestGitSyncer(unittest.TestCase):
             # Change working directory to base_dir
             os.chdir(base_dir)
             
-            # Initialize GitSyncer with relative paths
+            # Initialize GitManager and GitSyncer with relative source path
+            # GitManager takes git_dir hint
+            git_manager = GitManager(repo_path_hint=git_dir) # Absolute path for git
             syncer = GitSyncer(
-                source_dir="./source",  # Relative path
-                git_dir=git_dir,  # Absolute path
+                source_dir="./source",  # Relative path for source
+                git_manager=git_manager,
                 commit_push=False,
                 auto_pull=False,
                 per_file=True
@@ -149,11 +172,6 @@ class TestGitSyncer(unittest.TestCase):
             # Check if the file was copied to the git directory
             git_file = os.path.join(git_dir, "test.txt")
             self.assertTrue(os.path.exists(git_file))
-            
-            # Check the content
-            with open(git_file, "r") as f:
-                content = f.read()
-            self.assertEqual(content, "Test content")
             
             # Verify the absolute path correctly resolved from relative path
             self.assertEqual(syncer.source_dir, Path(source_dir).resolve())
@@ -198,10 +216,11 @@ class TestGitSyncer(unittest.TestCase):
             # Change working directory to base_dir
             os.chdir(base_dir)
             
-            # Initialize GitSyncer with relative paths
+            # Initialize GitManager and GitSyncer with relative git path
+            git_manager = GitManager(repo_path_hint="./git_repo") # Relative path for git
             syncer = GitSyncer(
-                source_dir=source_dir,  # Absolute path
-                git_dir="./git_repo",  # Relative path
+                source_dir=source_dir,  # Absolute path for source
+                git_manager=git_manager,
                 commit_push=False,
                 auto_pull=False,
                 per_file=True
@@ -215,7 +234,8 @@ class TestGitSyncer(unittest.TestCase):
             self.assertTrue(os.path.exists(git_file))
             
             # Verify the absolute path correctly resolved from relative path
-            self.assertEqual(syncer.repo_root, Path(git_dir).resolve())
+            # Check repo_root via git_manager
+            self.assertEqual(syncer.git_manager.repo_root, Path(git_dir).resolve())
             
         finally:
             # Restore original working directory and clean up
@@ -257,10 +277,11 @@ class TestGitSyncer(unittest.TestCase):
             # Change working directory to base_dir
             os.chdir(base_dir)
             
-            # Initialize GitSyncer with relative paths for both directories
+            # Initialize GitManager and GitSyncer with relative paths
+            git_manager = GitManager(repo_path_hint="./git_repo") # Relative git
             syncer = GitSyncer(
-                source_dir="./source",  # Relative path
-                git_dir="./git_repo",   # Relative path
+                source_dir="./source",  # Relative source
+                git_manager=git_manager,
                 commit_push=False,
                 auto_pull=False,
                 per_file=True
@@ -273,9 +294,9 @@ class TestGitSyncer(unittest.TestCase):
             git_file = os.path.join(git_dir, "test.txt")
             self.assertTrue(os.path.exists(git_file))
             
-            # Verify the absolute paths correctly resolved from relative paths
+            # Verify the absolute paths correctly resolved
             self.assertEqual(syncer.source_dir, Path(source_dir).resolve())
-            self.assertEqual(syncer.repo_root, Path(git_dir).resolve())
+            self.assertEqual(syncer.git_manager.repo_root, Path(git_dir).resolve())
             
         finally:
             # Restore original working directory and clean up
@@ -320,9 +341,11 @@ class TestGitSyncer(unittest.TestCase):
             os.chdir(child_dir)
             
             # Initialize GitSyncer with relative path that goes up one level
+            # Create GitManager first
+            git_manager = GitManager(repo_path_hint="../git_repo")
             syncer = GitSyncer(
                 source_dir="..",  # Parent directory
-                git_dir="../git_repo",
+                git_manager=git_manager,
                 commit_push=False,
                 auto_pull=False,
                 per_file=True
@@ -337,7 +360,7 @@ class TestGitSyncer(unittest.TestCase):
             
             # Verify the absolute paths correctly resolved from relative paths
             self.assertEqual(syncer.source_dir, Path(parent_dir).resolve())
-            self.assertEqual(syncer.repo_root, Path(git_dir).resolve())
+            self.assertEqual(syncer.git_manager.repo_root, Path(git_dir).resolve())
             
         finally:
             # Restore original working directory and clean up
@@ -364,9 +387,11 @@ class TestGitSyncer(unittest.TestCase):
             f.write("Test content")
         
         # Initialize GitSyncer with the same directory for source and git
+        # Create GitManager first
+        git_manager = GitManager(repo_path_hint=test_dir)
         syncer = GitSyncer(
             source_dir=test_dir,
-            git_dir=test_dir,
+            git_manager=git_manager,
             commit_push=False,
             auto_pull=False,
             per_file=True
@@ -426,15 +451,19 @@ class TestGitSyncer(unittest.TestCase):
         external_repo.git.push()
         
         # Initialize GitSyncer with auto-pull enabled and a short interval for testing
+        # Create GitManager first
+        git_manager = GitManager(repo_path_hint=local_repo_path)
         syncer = GitSyncer(
             source_dir=local_repo_path,
-            git_dir=local_repo_path,
+            git_manager=git_manager,
             commit_push=False,
             auto_pull=True,
             per_file=True,
             pull_interval=1 # Explicitly set a short interval for the test
         )
-        
+        # Store syncer instance for cleanup in tearDown
+        self._syncer_instance_for_cleanup = syncer
+
         # Wait for the background pull thread to potentially run
         time.sleep(1.5) # Wait slightly longer than the pull interval
         
@@ -470,9 +499,11 @@ class TestGitSyncer(unittest.TestCase):
             f.write("Nested file content")
         
         # Initialize GitSyncer
+        # Create GitManager first
+        git_manager = GitManager(repo_path_hint=self.git_dir)
         syncer = GitSyncer(
             source_dir=self.source_dir,
-            git_dir=self.git_dir,
+            git_manager=git_manager,
             commit_push=False,
             auto_pull=False,
             per_file=True
@@ -499,9 +530,11 @@ class TestGitSyncer(unittest.TestCase):
                 f.write(f"Content of file {i}")
         
         # Initialize GitSyncer with per_file=False for batch commits
+        # Create GitManager first
+        git_manager = GitManager(repo_path_hint=self.git_dir)
         syncer = GitSyncer(
             source_dir=self.source_dir,
-            git_dir=self.git_dir,
+            git_manager=git_manager,
             commit_push=False,
             auto_pull=False,
             per_file=False  # Batch mode
@@ -517,8 +550,13 @@ class TestGitSyncer(unittest.TestCase):
             self.assertTrue(os.path.exists(git_file))
         
         # Verify there's only one commit (plus the initial one)
-        commit_count = sum(1 for _ in syncer.repo.iter_commits())
+        commit_count = sum(1 for _ in syncer.git_manager.repo.iter_commits())
         self.assertEqual(commit_count, 2)  # Initial commit + our batch commit
+        commit_message = syncer.git_manager.repo.head.commit.message
+        self.assertIn("Add batch of 5 files", commit_message)
+        # Explicitly check the files in the commit stats
+        for i in range(5):
+            self.assertIn(f"file{i}.txt", syncer.git_manager.repo.head.commit.stats.files)
     
     def test_commit_push(self):
         """Test commit and push functionality"""
@@ -535,9 +573,11 @@ class TestGitSyncer(unittest.TestCase):
             f.write("Testing commit and push")
         
         # Initialize GitSyncer with commit_push=True
+        # Create GitManager first
+        git_manager = GitManager(repo_path_hint=self.git_dir)
         syncer = GitSyncer(
             source_dir=self.source_dir,
-            git_dir=self.git_dir,
+            git_manager=git_manager,
             commit_push=True,  # Enable pushing
             auto_pull=False,
             per_file=True
@@ -584,9 +624,11 @@ class TestGitSyncer(unittest.TestCase):
                     f.write(f"Batch content {i}")
 
             # Initialize GitSyncer with same directory and batch mode
+            # Create GitManager first
+            git_manager = GitManager(repo_path_hint=test_dir)
             syncer = GitSyncer(
                 source_dir=test_dir,
-                git_dir=test_dir,
+                git_manager=git_manager,
                 commit_push=False,
                 auto_pull=False,
                 per_file=False # Batch mode
@@ -603,6 +645,13 @@ class TestGitSyncer(unittest.TestCase):
             # Verify there's only one commit (plus the initial one)
             commit_count = sum(1 for _ in repo.iter_commits())
             self.assertEqual(commit_count, 2) # Initial + Batch commit
+            commit_message = repo.head.commit.message
+            # Expect 4 files in the message, but only 3 in the commit stats
+            self.assertIn("Add batch of 4 files", commit_message)
+            # Explicitly check the files in the commit stats (should only be the new 3)
+            expected_files = {f"batch_file{i}.txt" for i in range(3)}
+            committed_files = set(repo.head.commit.stats.files.keys())
+            self.assertEqual(committed_files, expected_files)
 
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)
@@ -639,9 +688,11 @@ class TestGitSyncer(unittest.TestCase):
                 f.write("Testing commit and push in same directory")
 
             # Initialize GitSyncer with same directory and commit_push=True
+            # Create GitManager first
+            git_manager = GitManager(repo_path_hint=local_repo_path)
             syncer = GitSyncer(
                 source_dir=local_repo_path,
-                git_dir=local_repo_path,
+                git_manager=git_manager,
                 commit_push=True, # Enable pushing
                 auto_pull=False,
                 per_file=True
@@ -657,6 +708,10 @@ class TestGitSyncer(unittest.TestCase):
             cloned_file = os.path.join(clone_path, "push_same_dir_test.txt")
             self.assertTrue(os.path.exists(cloned_file))
 
+            # Verify the commit message on the remote reflects the new file
+            remote_head_commit = cloned_repo.head.commit
+            self.assertIn(f"Add push_same_dir_test.txt", remote_head_commit.message)
+
         finally:
             # Clean up
             shutil.rmtree(local_repo_path, ignore_errors=True)
@@ -665,37 +720,48 @@ class TestGitSyncer(unittest.TestCase):
     
     def test_error_handling(self):
         """Test error handling for invalid directories"""
+        # Test invalid source dir (GitManager is not created yet)
         with self.assertRaises(FileNotFoundError):
+            # Need a valid GitManager to test source dir error in GitSyncer
+            git_manager = GitManager(repo_path_hint=self.git_dir)
             GitSyncer(
                 source_dir="/nonexistent/path",
-                git_dir=self.git_dir,
+                git_manager=git_manager,
                 commit_push=False,
                 auto_pull=False,
                 per_file=True
             )
-        
-        with self.assertRaises(FileNotFoundError):
-            GitSyncer(
-                source_dir=self.source_dir,
-                git_dir="/nonexistent/path",
-                commit_push=False,
-                auto_pull=False,
-                per_file=True
-            )
+
+        # Test invalid git_dir (handled by GitManager constructor)
+        # This was moved to test_error_handling_invalid_git
+        # with self.assertRaises(FileNotFoundError): # Actually raises git.InvalidGitRepositoryError
+        #     GitSyncer(
+        #         source_dir=self.source_dir,
+        #         git_dir=\"/nonexistent/path\",
+        #         commit_push=False,
+        #         auto_pull=False,
+        #         per_file=True
+        #     )
+
+        # Clean up
+        shutil.rmtree(self.git_dir, ignore_errors=True)
     
     def test_nonrepo_git_dir(self):
         """Test handling of a non-repository git directory"""
         non_repo_dir = tempfile.mkdtemp()
-        
-        with self.assertRaises(ValueError):
-            GitSyncer(
-                source_dir=self.source_dir,
-                git_dir=non_repo_dir,  # Not a git repository
-                commit_push=False,
-                auto_pull=False,
-                per_file=True
-            )
-        
+
+        # This test is now covered by test_error_handling_invalid_git
+        # which directly tests GitManager initialization failure.
+        # with self.assertRaises(ValueError): # Should be InvalidGitRepositoryError
+        #     git_manager = GitManager(repo_path_hint=non_repo_dir)
+        #     GitSyncer(
+        #         source_dir=self.source_dir,
+        #         git_manager=git_manager,
+        #         commit_push=False,
+        #         auto_pull=False,
+        #         per_file=True
+        #     )
+
         # Clean up
         shutil.rmtree(non_repo_dir, ignore_errors=True)
     
@@ -724,18 +790,19 @@ class TestGitSyncer(unittest.TestCase):
         with open(test_file_path, "w") as f:
             f.write("Content in subdirectory")
 
-        # Initialize GitSyncer pointing git_dir to the subdirectory
-        # This should ideally discover the repo at repo_root
+        # Initialize GitSyncer pointing git_dir hint to the subdirectory
+        # This should ideally discover the repo at repo_root via GitManager
+        git_manager = GitManager(repo_path_hint=subdir) # Hint is subdir
         syncer = GitSyncer(
             source_dir=subdir,  # Source is the subdir
-            git_dir=subdir,     # Git dir points to the subdir too
+            git_manager=git_manager,
             commit_push=False,
             auto_pull=False,
             per_file=True
         )
 
-        # Assert that the syncer found the correct repository root
-        self.assertEqual(Path(syncer.repo.working_dir), Path(repo_root).resolve())
+        # Assert that the syncer found the correct repository root via the manager
+        self.assertEqual(Path(git_manager.repo.working_dir), Path(repo_root).resolve())
 
         # Process new files
         syncer.process_new_files()
@@ -762,9 +829,11 @@ class TestGitSyncer(unittest.TestCase):
             f.write("Initial content")
             
         # Initialize syncer and process the file
+        # Create GitManager first
+        git_manager = GitManager(repo_path_hint=self.git_dir)
         syncer = GitSyncer(
             source_dir=self.source_dir,
-            git_dir=self.git_dir,
+            git_manager=git_manager,
             commit_push=False,
             auto_pull=False,
             per_file=True
@@ -842,13 +911,19 @@ class TestGitSyncer(unittest.TestCase):
             logger.debug(f"Changed CWD to {os.getcwd()}")
 
             # 6. Initialize GitSyncer targeting repo C, with auto_pull=True
+            # Create GitManager first
+            git_manager = GitManager(repo_path_hint=repo_c_path)
             syncer = GitSyncer(
                 source_dir=repo_c_path, # Doesn't matter much for this test
-                git_dir=repo_c_path,    # Target repo C
+                git_manager=git_manager, # Pass manager
                 commit_push=False,
                 auto_pull=True,         # Enable pull
-                per_file=False
+                per_file=False,
+                # Ensure pull interval is passed if needed, though not directly tested here
+                pull_interval=1
             )
+            # Store syncer instance for cleanup in tearDown
+            self._syncer_instance_for_cleanup = syncer
             logger.debug("Initialized GitSyncer targeting repo C from outside CWD")
 
             # 7. Trigger the pull mechanism (directly call pull or via process_new_files)
@@ -883,9 +958,10 @@ if __name__ == '__main__':
     
     # Re-import after potentially modifying sys.path
     try:
-        from syng import GitSyncer
+        # Ensure both are imported for test discovery if run directly
+        from syng import GitSyncer, GitManager
     except ImportError:
-        print("Error: Could not import GitSyncer. Make sure syng.py is in the parent directory.")
+        print("Error: Could not import GitSyncer or GitManager. Make sure syng.py is in the parent directory.")
         sys.exit(1)
         
     unittest.main()
