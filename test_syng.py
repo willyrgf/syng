@@ -10,10 +10,13 @@ import time
 import threading
 import git
 import logging
+from typing import Optional
 
 # Set logging level to reduce output
 # Only show errors and critical messages during tests
-logging.getLogger('syng').setLevel(logging.WARNING)
+logging.basicConfig(level=logging.WARNING) # Set root logger level
+logger = logging.getLogger('syng') # Get the logger used by the application
+logger.setLevel(logging.WARNING)
 logging.getLogger('git.cmd').setLevel(logging.WARNING) # Silence GitPython command logging too
 
 # Import the GitSyncer class directly from the syng.py script in the root
@@ -41,8 +44,23 @@ class TestGitSyncer(unittest.TestCase):
             f.write("# Test Repository")
         self.repo.git.add("README.md")
         self.repo.git.commit("-m", "Initial commit")
+        
+        # Placeholder for syncer instance if created by a test
+        self._syncer_instance_for_cleanup: Optional[GitSyncer] = None
     
     def tearDown(self):
+        # Clean up syncer instance if it exists and has active threads
+        if self._syncer_instance_for_cleanup:
+            syncer = self._syncer_instance_for_cleanup
+            if syncer._stop_event and not syncer._stop_event.is_set():
+                logger.debug("Signaling stop event in tearDown")
+                syncer._stop_event.set()
+            if syncer._pull_thread and syncer._pull_thread.is_alive():
+                logger.debug("Joining pull thread in tearDown")
+                syncer._pull_thread.join(timeout=5)
+                if syncer._pull_thread.is_alive():
+                    logger.warning("Pull thread did not terminate during tearDown")
+
         # Clean up temporary directories
         shutil.rmtree(self.source_dir, ignore_errors=True)
         shutil.rmtree(self.git_dir, ignore_errors=True)
@@ -443,7 +461,9 @@ class TestGitSyncer(unittest.TestCase):
             per_file=True,
             pull_interval=1 # Explicitly set a short interval for the test
         )
-        
+        # Store syncer instance for cleanup in tearDown
+        self._syncer_instance_for_cleanup = syncer
+
         # Wait for the background pull thread to potentially run
         time.sleep(1.5) # Wait slightly longer than the pull interval
         
@@ -532,6 +552,11 @@ class TestGitSyncer(unittest.TestCase):
         # Verify there's only one commit (plus the initial one)
         commit_count = sum(1 for _ in syncer.git_manager.repo.iter_commits())
         self.assertEqual(commit_count, 2)  # Initial commit + our batch commit
+        commit_message = syncer.git_manager.repo.head.commit.message
+        self.assertIn("Add batch of 5 files", commit_message)
+        # Explicitly check the files in the commit stats
+        for i in range(5):
+            self.assertIn(f"file{i}.txt", syncer.git_manager.repo.head.commit.stats.files)
     
     def test_commit_push(self):
         """Test commit and push functionality"""
@@ -620,6 +645,13 @@ class TestGitSyncer(unittest.TestCase):
             # Verify there's only one commit (plus the initial one)
             commit_count = sum(1 for _ in repo.iter_commits())
             self.assertEqual(commit_count, 2) # Initial + Batch commit
+            commit_message = repo.head.commit.message
+            # Expect 4 files in the message, but only 3 in the commit stats
+            self.assertIn("Add batch of 4 files", commit_message)
+            # Explicitly check the files in the commit stats (should only be the new 3)
+            expected_files = {f"batch_file{i}.txt" for i in range(3)}
+            committed_files = set(repo.head.commit.stats.files.keys())
+            self.assertEqual(committed_files, expected_files)
 
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)
@@ -675,6 +707,10 @@ class TestGitSyncer(unittest.TestCase):
             # Check if the file exists in the cloned repo
             cloned_file = os.path.join(clone_path, "push_same_dir_test.txt")
             self.assertTrue(os.path.exists(cloned_file))
+
+            # Verify the commit message on the remote reflects the new file
+            remote_head_commit = cloned_repo.head.commit
+            self.assertIn(f"Add push_same_dir_test.txt", remote_head_commit.message)
 
         finally:
             # Clean up
@@ -886,6 +922,8 @@ class TestGitSyncer(unittest.TestCase):
                 # Ensure pull interval is passed if needed, though not directly tested here
                 pull_interval=1
             )
+            # Store syncer instance for cleanup in tearDown
+            self._syncer_instance_for_cleanup = syncer
             logger.debug("Initialized GitSyncer targeting repo C from outside CWD")
 
             # 7. Trigger the pull mechanism (directly call pull or via process_new_files)

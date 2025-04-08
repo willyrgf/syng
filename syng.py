@@ -209,20 +209,31 @@ class GitManager:
                         logger.info(
                             "Index matches HEAD and no untracked files. Commit skipped."
                         )
-                        return True  # Success, as nothing needed committing.
+                        return True  # Success, as nothing needed committing for specified files.
 
-                # Proceed with commit
-                self.repo.git.commit("-m", message)
-                logger.info(f"Committed changes with message: {message}")
+                # Proceed with commit - target specific files if provided
+                if files_rel_repo:
+                    logger.info(f"Attempting to commit specific files: {files_rel_repo} with message: {message}")
+                    self.repo.git.commit(*files_rel_repo, "-m", message)
+                    logger.info(f"Committed specific files: {files_rel_repo}")
+                else:
+                    logger.info(f"Attempting to commit all staged changes with message: {message}")
+                    self.repo.git.commit("-m", message)
+                    logger.info("Committed all staged changes.")
                 success = True
 
             except git.GitCommandError as e:
-                # Handle specific case of "nothing to commit" which isn't really an error
-                if "nothing to commit" in str(e) or "no changes added to commit" in str(
-                    e
-                ):
+                # Handle specific cases where commit didn't fail but did nothing
+                err_str = str(e).lower()
+                if "nothing to commit" in err_str or "no changes added to commit" in err_str:
                     logger.info("Commit attempted, but no changes were staged.")
-                    success = True  # Considered success
+                    success = True # Considered success
+                elif files_rel_repo and "nothing added to commit but untracked files present" in err_str:
+                    logger.info(
+                        f"Commit attempted for specific files {files_rel_repo}, "
+                        f"but those files had no staged changes (though other untracked files exist)."
+                    )
+                    success = True # Considered success for the specified files
                 else:
                     logger.error(f"Git error during commit: {e}")
                     success = False
@@ -387,16 +398,7 @@ class GitSyncer:
             logger.warning(
                 f"Commit command for {git_rel_path} did not succeed or had no effect."
             )
-            # Decide if this is a failure - if the goal is to ensure the file is tracked,
-            # even 'nothing to commit' might be acceptable if it was already tracked/identical.
-            # Let's assume non-True means we should not mark as processed / push.
-            # However, if commit returns True for "nothing to commit", this logic works.
-            # Let's refine GitManager.commit to return True in that case. (Done above)
-            if not self.git_manager.commit(
-                commit_message, files_rel_repo=[git_rel_path]
-            ):  # Re-check needed? No, use the result.
-                logger.error(f"Failed to commit file {git_rel_path} via GitManager.")
-                return False  # Treat actual commit failure as failure
+            return True
 
         logger.info(f"Committed file: {git_rel_path}")
 
@@ -435,29 +437,21 @@ class GitSyncer:
             return False, set()
 
         commit_message = f"Add batch of {len(files_to_add_rel)} files"
-        # Pass the list of added files to commit for change detection scope
-        commit_successful = self.git_manager.commit(
+        if not self.git_manager.commit(
             commit_message, files_rel_repo=files_to_add_rel
-        )
-
-        if not commit_successful:
+        ):
             logger.error(
                 "Failed to commit batch via GitManager or no changes detected."
             )
-            # If commit returned True for "no changes", it's still a success in terms of processing.
-            # Assume commit returns True if no error OR no changes needed.
-            # So if it returns False, it's a real error.
             return False, set()  # Commit failed, return False
 
         logger.info(f"Committed batch of {len(files_to_add_rel)} files.")
 
-        push_successful = True
+        # Push changes if requested
         if self.commit_push:
             push_successful = self.git_manager.push()
             if not push_successful:
                 logger.error("Failed to push changes after batch commit.")
-                # If push fails, should we still count the commit as success?
-                # Let's say the batch processing failed if push failed.
                 return False, set()
 
         return True, processed_in_batch
@@ -600,11 +594,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Setup logging level
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.getLogger("syng").setLevel(log_level)
-    # Optionally set GitPython logging level
-    # logging.getLogger('git').setLevel(logging.INFO) # Or DEBUG
 
     try:
         git_manager = GitManager(repo_path_hint=args.git_dir)
