@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import argparse
 import os
 import time
@@ -213,11 +214,15 @@ class GitManager:
 
                 # Proceed with commit - target specific files if provided
                 if files_rel_repo:
-                    logger.info(f"Attempting to commit specific files: {files_rel_repo} with message: {message}")
+                    logger.info(
+                        f"Attempting to commit specific files: {files_rel_repo} with message: {message}"
+                    )
                     self.repo.git.commit(*files_rel_repo, "-m", message)
                     logger.info(f"Committed specific files: {files_rel_repo}")
                 else:
-                    logger.info(f"Attempting to commit all staged changes with message: {message}")
+                    logger.info(
+                        f"Attempting to commit all staged changes with message: {message}"
+                    )
                     self.repo.git.commit("-m", message)
                     logger.info("Committed all staged changes.")
                 success = True
@@ -225,15 +230,21 @@ class GitManager:
             except git.GitCommandError as e:
                 # Handle specific cases where commit didn't fail but did nothing
                 err_str = str(e).lower()
-                if "nothing to commit" in err_str or "no changes added to commit" in err_str:
+                if (
+                    "nothing to commit" in err_str
+                    or "no changes added to commit" in err_str
+                ):
                     logger.info("Commit attempted, but no changes were staged.")
-                    success = True # Considered success
-                elif files_rel_repo and "nothing added to commit but untracked files present" in err_str:
+                    success = True  # Considered success
+                elif (
+                    files_rel_repo
+                    and "nothing added to commit but untracked files present" in err_str
+                ):
                     logger.info(
                         f"Commit attempted for specific files {files_rel_repo}, "
                         f"but those files had no staged changes (though other untracked files exist)."
                     )
-                    success = True # Considered success for the specified files
+                    success = True  # Considered success for the specified files
                 else:
                     logger.error(f"Git error during commit: {e}")
                     success = False
@@ -437,9 +448,7 @@ class GitSyncer:
             return False, set()
 
         commit_message = f"Add batch of {len(files_to_add_rel)} files"
-        if not self.git_manager.commit(
-            commit_message, files_rel_repo=files_to_add_rel
-        ):
+        if not self.git_manager.commit(commit_message, files_rel_repo=files_to_add_rel):
             logger.error(
                 "Failed to commit batch via GitManager or no changes detected."
             )
@@ -549,9 +558,13 @@ class GitSyncer:
     def _periodic_pull_worker(self, stop_event: threading.Event) -> None:
         """Worker function for the background pull thread."""
         logger.info("Periodic pull worker started.")
+        logger.info("Try first pull...")
+        if not self.pull():
+            logger.warning("Pull failed, will retry next interval.")
+
         while not stop_event.wait(timeout=self.pull_interval):
             logger.info("Pull interval elapsed, attempting to pull changes...")
-            if not self.pull():  # Delegates to git_manager.pull
+            if not self.pull():
                 logger.warning("Pull failed, will retry next interval.")
             # Loop continues until stop_event is set or wait times out
         logger.info("Periodic pull worker stopping.")
@@ -628,4 +641,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
